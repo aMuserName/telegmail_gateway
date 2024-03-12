@@ -1,19 +1,20 @@
 import os
-import random
+import re
 import smtplib
-import string
 # TODO: convert image to pdg
 import img2pdf
+import asyncio
 
 import telebot
 from telebot import types
 from classes import User, Connection, Letter
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
 from email.utils import formatdate
 from dotenv import load_dotenv
-
+from functools import wraps
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -31,7 +32,7 @@ SURNAME = int(os.getenv('SURNAME'))
 EMAIL = int(os.getenv('EMAIL'))
 DB_PATH = os.getenv('DB_PATH')
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 conn = Connection(DB_PATH)
 
 # create user table in sqlite on a start
@@ -39,41 +40,323 @@ var = conn.create_table('users')
 
 # upload all current user stored in DB
 user_dict = {}
-user_table_curs = conn.get_rows('users')
-for user_row in user_table_curs.fetchall():
-    obj = User(user_row[NAME], user_row[SURNAME], user_row[EMAIL], registered=True)
-    user_dict[user_row[CHAT_ID]] = obj
+# user_table_curs = conn.get_rows('users')
+# for user_row in user_table_curs.fetchall():
+#     obj = User(user_row[NAME], user_row[SURNAME], user_row[EMAIL], registered=True)
+#     user_dict[user_row[CHAT_ID]] = obj
 
+names =  {'CMR': '1. CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ)',
+        'Invoice': '2. ИНВОЙС',
+        'Specific': '3. СПЕЦИФИКАЦИЮ (РАЗБИВКА С РУССКИМ ОПИСАНИЕМ)',
+        'Packing': '4. ПАКИНГ ЛИСТ',
+        'Driver': '5. ПАСПОРТ ВОДИТЕЛЯ',
+        'Track': '6. ТЕХПАСПОРТ НА ТЯГАЧ',
+        'Trailer': '7. ТЕХПАСПОРТ НА ПОЛУПРИЦЕП',
+        'Permission': '8. СВИДЕТЕЛЬСТВО О ДОПУЩЕНИИ', 
+        'Carrier': '9. СВИДЕТЕЛЬСТВО ТАМОЖЕННОГО ПЕРЕВОЗЧИКА',
+        'Attach': 'Вложение'
+        }
+
+async def setTimeout(time, func):
+    await asyncio.sleep(time)
 
 def read_photo(photo_name):
     with open(photo_name, 'rb') as new_file:
         return new_file.read()
 
+def decorator(func):
+    @wraps(func)
+    def wrap(*args, **kwargs):
+        user_key, user = get_user_by_chat_id(user_dict, args[0].chat.id) 
+        number = user.number
+        key = user.key
+        return func(*args, number, key, **kwargs) 
+    return wrap
 
 # START HERE
 @bot.message_handler(commands=['help', 'start'])
 def start(message):
-    greetings, user = "", None
-    row = conn.get_user_by_chat_id(message.chat.id)
-    if not row:
-        markup = create_markup(("Обратная связь",))
-    else:
-        greetings = ', ' + row[NAME] + ' ' + row[SURNAME]
-        markup = create_markup(("Обратная связь", 'Сформировать заявку'))
-    bot.reply_to(message, f"Привет{greetings}! Я ваш бот-помошник. Помогу быстро сформировать заявку.",
+    try:
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    except TypeError:
+        user_key, user = None, None
+    markup = create_markup(('Сформировать заявку', 'Обратная связь'))
+    if user:
+        if user.registered:
+            markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Заявки'))
+    # 2 кнопки - Обратная связь и Сформировать заявку
+    # Промпт телефон для Сформировать заявку -> есть возможность создавать заявки
+    bot.reply_to(message, f"Привет! Я ваш бот-помошник. Помогу быстро сформировать заявку.",
                  reply_markup=markup)
 
 
-def get_document_by_file_id(message):
-    if message.photo:
-        file_id = message.photo[-1].file_id  # last or first???????
-        file_name = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10)) # random key
+def get_string(stroka, beg_str):
+    beg = stroka.index(beg_str)
+    end = stroka.find('\n', beg)
+    #print(beg)
+    #print(end)
+    #print(stroka[beg+6:end].strip())
+    return stroka[beg+6:end].strip()
+
+
+# Handle all sent text messages.
+@bot.message_handler(content_types=['text'])
+def get_text_message(message):
+    if message.text == 'Обратная связь':
+        try:
+            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        except TypeError:
+            user_key, user = None, None
+        markup = create_markup(('Завершить работу', ))
+        if user is None or not user.registered:
+            msg = bot.reply_to(message, (#"Можете написать нам письмо, "
+                                        #"и специалисты свяжутся с вами в ближайшее время!\n"
+                                    # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
+                                        "Напишите свой телефон для обратной связи:"), reply_markup=markup)
+            bot.register_next_step_handler(msg, process_telephone_step, prev_message=message)
+        #elif user:
+        else: 
+            msg = bot.reply_to(message, (#"Можете написать нам письмо, "
+                                        #"и специалисты свяжутся с вами в ближайшее время!\n"
+                                        # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
+                                        "Напишите то, что хотели бы передать:"), reply_markup=markup)
+            bot.register_next_step_handler(msg, process_body_step)
+    #elif message.text == 'Прикрепить':
+    #    msg = bot.reply_to(message, "Прикрепите вложение:")
+    #    bot.register_next_step_handler(msg, process_attach_step, -1, None)
+    elif message.text == 'Завершить работу':
+        try:
+            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        except TypeError:
+            user_key, user = None, None
+        markup = create_markup(('Сформировать заявку', 'Обратная связь'))
+        if user:
+            if user.registered:
+                markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Заявки'))
+        
+        bot.send_message(message.chat.id, ('До скорого.\n'
+                                           #'Если Вам что-то понадобится, нажмите: /start\n'
+                                           #'(конпку типа сделать)'
+                                           ))
+        msg = bot.send_message(message.chat.id, "Привет! Я ваш бот-помошник. Помогу быстро сформировать заявку.", reply_markup=markup)
+        #bot.register_next_step_handler(msg, start)
+
+    elif message.text == 'Сформировать заявку':
+        try:
+            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        except TypeError:
+            user_key, user = None, None
+        markup = create_markup(('Завершить работу', ))
+        if user is None or (user and not user.registered):
+            msg = bot.reply_to(message, (f"Прежде чем начать, напишите свой номер телефона.\n"),
+                                         #f"Номер телефона:")
+                            reply_markup=markup)
+            bot.register_next_step_handler(msg, process_telephone_step, prev_message=message)
+        elif user and user.registered:
+            msg = bot.reply_to(message, ("Приступим к формированию заявки!\n"
+                                        # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
+                                        "Напишите пост отправления:"), reply_markup=markup)
+            user.number = None
+            bot.register_next_step_handler(msg, process_src_step)
+        #elif :
+        #    msg = bot.reply_to(message, (#"Вам пока не дали доступ, но Вы можете написать нам письмо, "
+        #                                 #"и специалисты свяжутся с вами в ближайшее время!\n"
+        #                            # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
+        #                                 "Напишите то, что хотели бы передать:"))
+        #    bot.register_next_step_handler(msg, process_body_step)
+    elif message.text == 'Изменить заявку аываыва':
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        try:
+            number = -1
+            user.letters[number].body = None
+            user.letters[number].attachs = {}
+        except AttributeError:
+            number = None
+            markup = create_markup(('Сформировать заявку', 'Заявки', 'Завершить работу'))
+            bot.send_message(message.chat.id, "Не удалось найти последнюю заявку.", reply_markup=markup)
+            return
+        msg = bot.reply_to(message, ("Приступим к формированию заявки!\n"
+                                        # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
+                                        "Напишите пост отправления:"))
+        user.number = number
+        bot.register_next_step_handler(msg, process_src_step)
+    elif message.text == 'Изменить заявку':
+        try:
+            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        except TypeError:
+            user_key, user = None, None
+
+        list_letters = [f'Заявка #{index}' for index, val in enumerate(user.sent) if val.sort == 'Заявка']
+        markup = create_markup((*tuple(list_letters), 'Назад'))
+        if list_letters != []:
+            bot.send_message(message.chat.id, 'Выберете заявку:', reply_markup=markup)
+        else:
+            bot.send_message(message.chat.id, 'У вас пока нет отпрваленных заявок', reply_markup=markup)
+    elif re.match('Заявка #\d+', message.text):
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        matching = re.search(r'\d+', message.text)
+        number = int(matching.group())
+        user.number = number
+        letter = user.sent[number]
+        letter.edit = True
+        letter.sent = False
+        user.letters[number] = letter # copy sent ticket 
+        bot.send_message(message.chat.id, 'Приступим к изменению.')
+        markup = create_markup(('Дальше', 'Изменить'))
+        src = get_string(letter.body, 'ления:')
+        msg = bot.send_message(message.chat.id, f'Проверьте правильность.\n Пост отправления: {src}', reply_markup=markup)
+        bot.register_next_step_handler(msg, process_src_step)
+    elif message.text == 'Заявки':
+        try:
+            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        except TypeError:
+            user_key, user = None, None
+        if user:
+            markup = create_markup(('Изменить заявку', 'Все заявки','Назад'))
+        else:
+            markup = create_markup(('Назад', ))
+        bot.send_message(message.chat.id, ('Кнопка "Все заявки" - покажет все завяки\n'
+                                           'Кнопка "Изменить заявку" - позволит изменить заявку'), reply_markup=markup)
+    elif message.text == 'Назад':
+        try:
+            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        except TypeError:
+            user_key, user = None, None
+        markup = create_markup(('Сформировать заявку', 'Обратная связь'))
+        if user:
+            if user.registered:
+                markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Заявки'))
+        msg = bot.send_message(message.chat.id, "Привет! Я ваш бот-помошник. Помогу быстро сформировать заявку.", reply_markup=markup)
+    elif message.text == 'Все заявки':
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        #list_letters = [f'Заявка #{index}' for index, val in enumerate(user.sent)]
+        #markup = create_markup(('Отправить заявку', 'Сформировать заявку', 'Текущие заявки', 'Отправленные заявки'))
+        
+        markup = create_markup(('Изменить заявку', 'Все заявки','Завершить работу'))
+        if user.sent != []:
+            bot.send_message(message.chat.id, 'Ваши отправленные заявки:')
+            for index, letter in enumerate([letter for letter in user.sent if letter.sort == 'Заявка']):
+                body = (f"{letter.sort} под №{index}\n"
+                        f"{letter.body}\n")
+                if letter.attachs != {}:
+                    bot.send_message(message.chat.id, body + '\n Вложения:')
+                    send_all_dcouments(letter, message.chat.id, names)
+                else:
+                    bot.send_message(message.chat.id, body + '\n Без вложений.')
+            bot.send_message(message.chat.id, 'Это были все ваши отправленные заявки.', reply_markup=markup)
+        else:
+            bot.send_message(message.chat.id, 'Нет отправленных заявок', reply_markup=markup)
+    elif message.text == 'Отправить заявку':  # if directly this pressed - test case
+        # # сообщение: Ваше соообщение отправлено, наши специалисты скоро свяжутся с Вами.
+        # user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        # #markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Отправленные заявки', 'Завершить работу'))
+        # markup = create_markup(('Сформировать заявку',  'Заявки', 'Завершить работу'))
+        # # SMTP send
+        # list_senderrors = []
+        # sent_number = len(user.sent)
+        # for indx, letter in enumerate(user.letters): # поменить номер заявки в пуле
+        #     bot.send_message(message.chat.id, "Формирую заявку.")  # Отправляю
+        #     body = (f"Телефон: {user_key}\n"
+        #             f"{letter.body}\n")
+        #     # TODO: pythonic nested loop
+        #     files = []
+        #     for attach in letter.attachs.values():
+        #         for index, page in enumerate(attach):
+        #             page[0] = page[0] + f'_str_{index+1}'
+        #             files.append(page)
+
+        #     #files = list(page for page in attach for attach in letter.attachs.values())
+        #     if letter.edit:
+        #         mail_subj = f"Дополнение по {letter.sort} №{user.number} от User{message.chat.id}"
+        #     else:
+        #         mail_subj = f"{letter.sort} №{indx} от User{message.chat.id}"
+        #     senderrors = send_mail(BOT_MAIL_ADDRESS, MAIL_ADDRESS, mail_subj, body, BOT_MAIL_PASS, files=files)
+        #     list_senderrors.append(senderrors) if senderrors is not {} else list_senderrors  
+        #     if not senderrors:
+        #         bot.send_message(message.chat.id, f'Заявка №{indx} успешно отправлена.')
+        #         letter.sent = True
+        #         user.sent.insert(index, letter)                
+        #     else:
+        #         bot.send_message(message.chat.id, 'Не удалось отправить заявку.')
+        # user.letters = [letter for letter in user.letters if not letter.sent]
+        # if list_senderrors: # list of dict
+        #     bot.send_message(message.chat.id, 'Заявка(и) успешно отправлена(и). Скоро вернусь с ответом.',
+        #                      reply_markup=markup)
+        #     bot.send_message(message.chat.id, ('Что будем делать дальше?\n'
+        #                                        '(Выберите опцию ниже)'),
+        #                      reply_markup=markup)
+        # else:
+        #     print('SMTP send errors: ', list_senderrors)
+        #     bot.send_message(message.chat.id, ('Что-то пошло не так. Давайте начнем заново.\n'
+        #                                        'Выберите опцию...'),
+        #                      reply_markup=markup)
+        pass
+    elif message.text == 'Нет':
+        msg = bot.reply_to(message, "Давайте начнем сначала.\nYНапишите пост отправления: ")
+        bot.register_next_step_handler(msg, process_content_step)
+    elif re.match('Изменить заявку#\d+', message.text):
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        matching = re.search(r'\d+', message.text)
+        try:
+            number = int(matching.group()) - len(user.sent)
+            user.letters[number].attachs = {}
+        except AttributeError:
+            number = None
+            bot.send_message(message.chat.id, "Не удалось найти заявку с таким номером. Попробуйте еще раз.")
+        msg = bot.reply_to(message, ("Приступим к формированию заявки!\n"
+                                        # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
+                                        "Напишите пост отправления:"))
+        user.number = number
+        bot.register_next_step_handler(msg, process_src_step)
+    elif re.match('Заявка фвывфыв #\d+', message.text):
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        matching = re.search(r'\d+', message.text)
+        number = int(matching.group()) - len(user.sent)
+        letter = user.letters[int(number)]
+        markup = create_markup((f"Изменить заявку#{int(number) + len(user.sent)}", "Назад"))
+        bot.send_message(message.chat.id, message.text, reply_markup=markup)
+        body = (f"{letter.body}\n")
+        bot.send_message(message.chat.id, body + '\n Вложения:')
+        send_all_dcouments(letter, message.chat.id, names)
+    elif message.text == 'Заявки фвыфв':
+        # TODO: to be DRY
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        letters = user.letters
+        #list_letters = [f'Заявка #{index}' for index, val in enumerate(letters)]
+        #markup = create_markup(('Отправить заявку', 'Сформировать заявку', 'Текущие заявки', 'Отправленные заявки'))
+        markup = create_markup(('Текущие заявки', 'Отправленные заявки', 'Назад', 'Завершить работу'))
+        bot.send_message(message.chat.id, ('Вы можете посмотреть все Ваши заявки.\n'
+                                           'Кнопка "Текущие заявки" - отобразит все созданные заявки.\n'
+                                           'Кнопка "Отправленные заявки" - отобразит все отправленные заявки.\n'),
+                         reply_markup=markup)
+        # TODO: to be DRY
+    elif message.text == 'Назад вфыф':
+        # TODO: to be DRY
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        letters = user.letters
+        #list_letters = [f'Заявка #{index}' for index, val in enumerate(letters)]
+        #markup = create_markup(('Отправить заявку', 'Сформировать заявку', 'Текущие заявки', 'Отправленные заявки'))
+        markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Заявки', 'Завершить работу'))
+        bot.send_message(message.chat.id, (#'Вы можете сформировать еще одну заявку.\n'
+                                           'Кнопка "Оправить заявку" - отправит все созданные заявки.'),
+                         reply_markup=markup)
+        # TODO: to be DRY
+    elif message.text == 'Заявки фвывфыв':
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        list_letters = [f'Заявка #{index + len(user.sent)}' for index, val in enumerate(user.letters)]
+        markup = create_markup((*tuple(list_letters), 'Назад'))
+        if user.letters != []:
+            bot.send_message(message.chat.id, 'Ваши текущие заявки:')
+            for index, letter in enumerate(user.letters):
+                body = (f"Заявка под №{index + len(user.sent)}\n"
+                        f"{letter.body}\n")
+                bot.send_message(message.chat.id, body + '\n Вложения:')
+                send_all_dcouments(letter, message.chat.id, names)
+            bot.send_message(message.chat.id, 'Это были все ваши текущие заявки.', reply_markup=markup)
+        else:
+            bot.send_message(message.chat.id, 'У вас пока нет сформированных заявок', reply_markup=markup)
     else:
-        file_id = message.document.file_id
-        file_name = message.document.file_name
-    print('fileID = ', file_id, 'file_name = ', file_name)
-    file = bot.get_file(file_id)
-    return file_name, bot.download_file(file.file_path)
+        bot.reply_to(message, " Я вас не понимаю. Попробуйте /start")
 
 
 def create_markup(button_texts):
@@ -85,68 +368,86 @@ def create_markup(button_texts):
 
 
 # TODO: a few attachment
-@bot.message_handler(
-    content_types=['document', 'photo'])
-def process_content_step(message):
+#@bot.message_handler(
+    #content_types=['document', 'photo'])
+def process_content_step(message, number=-1):
     empty = False
     if message.text and message.text == 'Пропустить':
         empty = True
     elif message.text and message.text == 'Отменить':
         bot.register_next_step_handler(message, start)
-        user_dict[message.chat.id].letter = None
+        del user_dict[message.chat.id].letter[number]
         return
+    elif message.text and message.text == 'Да':
+        # TODO: to be DRY
+        bot.send_message(message.chat.id, 'Заявка сформирована.')
+        user = user_dict[message.chat.id]
+        letters = user.letters
+        list_letters = [f'Заявка #{index + len(user.sent)}' for index, val in enumerate(letters)]
+        markup = create_markup(('Отправить заявку', 'Сформировать заявку', 'Текущие заявки', 'Отправленные заявки', *tuple(list_letters)))
+        bot.send_message(message.chat.id, (#'Вы можете сформировать еще одну заявку.\n '
+                                           'Кнопка "Оправить заявку" - отправит все созданные заявки.'),
+                         reply_markup=markup)
+        return
+        # TODO: to be DRY
+    elif message.text == 'Нет, выбрать другие':
+        msg = bot.reply_to(message, ('Прикрепи необходимые документы '
+                                     '1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ)')
+                           )
+        bot.register_next_step_handler(msg, process_content_step)
     elif not message.document and not message.photo:
         msg = bot.reply_to(message, "Пожалуйста, прикрепите pdf, jpeg, png-файл.")
-        bot.register_next_step_handler(msg, process_content_step)
+        bot.register_next_step_handler(msg, process_content_step, number)
         return
 
     user = user_dict[message.chat.id]
+    letter = user.letters[number]
     markup = create_markup(('Отменить', 'Пропустить'))
-    if user.letter.attachs == {}:  # if there are no attachments (TODO: merge to conditions)
+    if letter.attachs == {}:  # if there are no attachments (TODO: merge to conditions)
         if update_attachs(message, user, 'CMR', 'CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ)', empty):
             return
         msg = bot.reply_to(message, f'Прикрепите ИНВОЙС: ', reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
-    elif set(user.letter.attachs.keys()) == {'CMR'}:
+        bot.register_next_step_handler(msg, process_content_step, number)
+    elif set(letter.attachs.keys()) == {'CMR'}:
         if update_attachs(message, user, 'Invoice', 'ИНВОЙС', empty):
             return
         msg = bot.reply_to(message, f'Прикрепите СПЕЦИФИКАЦИЮ (РАЗБИВКА С РУССКИМ ОПИСАНИЕМ): ', reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
-    elif set(user.letter.attachs.keys()) == {'CMR', 'Invoice'}:
+        bot.register_next_step_handler(msg, process_content_step, number)
+    elif set(letter.attachs.keys()) == {'CMR', 'Invoice'}:
         if update_attachs(message, user, 'Specific', 'СПЕЦИФИКАЦИЮ (РАЗБИВКА С РУССКИМ ОПИСАНИЕМ)', empty):
             return
         msg = bot.reply_to(message, f'Прикрепите ПАКИНГ ЛИСТ: ', reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
-    elif set(user.letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific'}:
+        bot.register_next_step_handler(msg, process_content_step, number)
+    elif set(letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific'}:
         if update_attachs(message, user, 'Parking_l', 'ПАКИНГ ЛИСТ', empty):
             return
         msg = bot.reply_to(message, f'Прикрепите ПАСПОРТ ВОДИТЕЛЯ: ', reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
-    elif set(user.letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l'}:
+        bot.register_next_step_handler(msg, process_content_step, number)
+    elif set(letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l'}:
         if update_attachs(message, user, 'Driver_pasp', 'ПАСПОРТ ВОДИТЕЛЯ', empty):
             return
         msg = bot.reply_to(message, f'Прикрепите ТЕХПАСПОРТ НА ТЯГАЧ: ', reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
-    elif set(user.letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l', 'Driver_pasp'}:
+        bot.register_next_step_handler(msg, process_content_step, number)
+    elif set(letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l', 'Driver_pasp'}:
         if update_attachs(message, user, 'Track', 'ТЕХПАСПОРТ НА ТЯГАЧ', empty):
             return
         msg = bot.reply_to(message, f'Прикрепите ТЕХПАСПОРТ НА ПОЛУПРИЦЕП: ', reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
-    elif set(user.letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l', 'Driver_pasp', 'Track'}:
+        bot.register_next_step_handler(msg, process_content_step, number)
+    elif set(letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l', 'Driver_pasp', 'Track'}:
         if update_attachs(message, user, 'Trailer', 'ТЕХПАСПОРТ НА ПОЛУПРИЦЕП', empty):
             return
         msg = bot.reply_to(message, f'Прикрепите СВИДЕТЕЛЬСТВО О ДОПУЩЕНИИ( СВИДЕТЕЛЬТВО ПОД ПЛОМБАМИ): ',
                            reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
-    elif set(user.letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l', 'Driver_pasp', 'Track',
-                                             'Trailer'}:
+        bot.register_next_step_handler(msg, process_content_step, number)
+    elif set(letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l', 'Driver_pasp', 'Track',
+                                                  'Trailer'}:
         if update_attachs(message, user, 'Cert', 'СВИДЕТЕЛЬСТВО О ДОПУЩЕНИИ( СВИДЕТЕЛЬТВО ПОД ПЛОМБАМИ)', empty):
             return
         msg = bot.reply_to(message, ('Прикрепите СВИДЕТЕЛЬСТВО ТАМОЖЕННОГО ПЕРЕВОЗЧИКА\n'
                                      '( ЕСЛИ ТРАНЗИТ ПОД ТАМОЖЕННФМ ПЕРЕВОЗЧИКОМ): '), reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
-    elif set(user.letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l', 'Driver_pasp', 'Track',
-                                             'Trailer', 'Cert'}:
+        bot.register_next_step_handler(msg, process_content_step, number)
+    elif set(letter.attachs.keys()) == {'CMR', 'Invoice', 'Specific', 'Parking_l', 'Driver_pasp', 'Track',
+                                                  'Trailer', 'Cert'}:
         if update_attachs(message, user, 'Carrier', ('СВИДЕТЕЛЬСТВО ТАМОЖЕННОГО ПЕРЕВОЗЧИКА \n',
                                                      '( ЕСЛИ ТРАНЗИТ ПОД ТАМОЖЕННФМ ПЕРЕВОЗЧИКОМ)'), empty):
             return
@@ -155,198 +456,771 @@ def process_content_step(message):
 
         # send all got files and its names
         # TODO: document_name
-        filtered_files = dict([item for item in user.letter.attachs.items() if item[1] is not None])
-        user.letter.attachs = filtered_files
-        for key, file_tuple in user.letter.attachs.items():
+        filtered_files = dict([item for item in letter.attachs.items() if item[1] is not None])
+        letter.attachs = filtered_files
+        for key, file_tuple in letter.attachs.items():
             bot.send_document(message.chat.id, caption=file_tuple[0], document=file_tuple[1])
 
-        bot.send_message(message.chat.id, 'Список документов верный?', reply_markup=markup)
-    return
+        msg = bot.send_message(message.chat.id, 'Список документов верный?', reply_markup=markup)
+        bot.register_next_step_handler(msg, process_content_step, number)
+    return      
 
-
-def update_attachs(message, user, key, error_str, empty, func=process_content_step):
+@decorator
+def process_src_step(message, number, key):
     try:
-        file_name, downloaded_file = get_document_by_file_id(message) if not empty else (None, None)
-        item = {key: None} if empty else {key: [file_name, downloaded_file]}
-        user.letter.attachs.update(item)
-        return False
-    except Exception as e:
-        msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
-                                     f'Прикрепите {error_str}: ')
-                           )
-        bot.register_next_step_handler(msg, func)
-        return True
-
-
-# Handle all sent text messages.
-@bot.message_handler(content_types=['text'])
-def get_text_message(message):
-    if message.text == 'Обратная связь':
-        if message.chat.id in user_dict.keys():
-            msg = bot.reply_to(message, 'Напишите то, что хотели бы передать:')
-            bot.register_next_step_handler(msg, process_body_step)
-        else:
-            msg = bot.reply_to(message, ("Вы еще не зарегистрированы.\n Можете написать нам письмо, "
-                                         "и специалисты свяжуться с вами в ближайшее время!\n"
-                                         # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
-                                         "Напишите свой телефон для обратной связи::"))
-            bot.register_next_step_handler(msg, process_telephone_step)
-    elif message.text == 'Сформировать заявку':
-        try:
-            row = conn.get_user_by_chat_id(message.chat.id)
-            msg = bot.reply_to(message, (f"Приступим к формированию заявкки!\n"
-                                         f"{row[NAME]}, напишите пост отправления: ")
-                               )
-            bot.register_next_step_handler(msg, process_src_step)
-        except TypeError:
-            msg = bot.reply_to(message, ("Вы еще не зарегистрированы.\n Можете написать нам письмо, "
-                                         "и специалисты свяжуться с вами в ближайшее время!\n"
-                                         "Напишите свой телефон для обратной связи::")
-                               )
-            bot.register_next_step_handler(msg, process_telephone_step)
-    elif (message.text == 'Да' or message.text == 'Всё верно' or
-          message.text == 'Отправить без вложений' or message.text == 'Отправить'):  # if directly this pressed - test case
-        bot.send_message(message.chat.id, "Формирую заявку.")  # Отправляю
-
-        # SMTP send
-        user = user_dict[message.chat.id]
-        if user.registered:
-            body = (f"Пост отправления: {user.letter.src}\n"
-                    f"Пост назначения:: {user.letter.dest}")
-        else:
-            body = user.letter.body
-        files = list(user.letter.attachs.values())
-        mail_subj = f"Заявка от User{message.chat.id}"
-        senderrors = send_mail(BOT_MAIL_ADDRESS, MAIL_ADDRESS, mail_subj, body, BOT_MAIL_PASS, files)
-        if user.registered:
-            markup = create_markup(('Сформировать заявку', 'Обратная связь'))
-        else:
-            markup = create_markup(('Обратная связь',))
-        if not senderrors:
-            bot.send_message(message.chat.id, 'Заявка успешно отправлена. Скоро вернусь с ответом.',
-                             reply_markup=markup)
-        else:
-            print('SMTP send errors: ', senderrors)
-            bot.send_message(message.chat.id, 'Что-то пошло не так. Давай начнем заново.',
-                             reply_markup=markup)
-
-    elif message.text == 'Нет':
-        msg = bot.reply_to(message, "Давайте начнем сначала.\nYНапишите пост отправления: ")
-        bot.register_next_step_handler(msg, process_content_step)
-    elif message.text == 'Прикрепить':
-        msg = bot.reply_to(message, "Прикрепите вложение:")
-        bot.register_next_step_handler(msg, process_attach_step)
-    elif message.text == 'Нет, выбрать другие':
-        msg = bot.reply_to(message, ('Прикрепи необходимые документы '
-                                     '1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ)')
-                           )
-        bot.register_next_step_handler(msg, process_content_step)
-    else:
-        bot.reply_to(message, " Я вас не понимаю. Попробуйте /start")
-
-
-def process_src_step(message):
-    try:
-        chat_id = message.chat.id
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
         src = message.text
-        user = user_dict[chat_id]
-        user.letter = Letter(src)
-        msg = bot.reply_to(message, 'Напишите пост назначения: ')
-        bot.register_next_step_handler(msg, process_dest_step)
+        if src == 'Завершить работу':
+            markup = create_markup(('Да', 'Нет'))
+            msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить формирование заявки?\n Все данные удалятся.', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_deletion_step, process_src_step, 'Src')
+            return
+        elif src == 'Дальше':
+            markup = create_markup(('Дальше', 'Изменить'))
+            dest = get_string(user.letters[number].body, 'чения:')
+            msg = bot.send_message(message.chat.id, f'Проверьте правильность.\n Пост назначения: {dest}', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_dest_step) 
+            return # go to dest step
+        elif src == 'Изменить':
+            msg = bot.reply_to(message, ("Напишите пост отправления:"), reply_markup=markup)
+            bot.register_next_step_handler(msg, process_src_step)
+            return
+        src =  f"Пост отправления: {src}\n"
+        if number is None:
+            letter = Letter(body=src, sort='Заявка')
+            user.letters.insert(len(user.sent) + len(user.letters), letter)
+            number = len(user.letters) - 1 
+        else: 
+            letter = user.letters[number]
+            letter.body = src
+        user.number = number
+        if not letter.edit:
+            msg = bot.reply_to(message, 'Напишите пост назначения: ')
+            markup = create_markup(('Завершить работу', ))
+            bot.register_next_step_handler(msg, process_dest_step)
+        else:
+            markup = create_markup(('Дальше', 'Изменить'))
+            dest = get_string(user.letters[number].body, 'чения:')
+            msg = bot.send_message(message.chat.id, f'Проверьте правильность.\n Пост назначения: {dest}', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_dest_step) 
     except Exception as e:
         msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
                                      'Напишите пост отправления: ')
                            )
-        bot.register_next_step_handler(msg, process_src_step)
+        #bot.register_next_step_handler(msg, process_src_step, number) &+c6WzHK5;lEbG=#
+def print_memo(chat_id, markup):
+    msg = bot.send_message(chat_id, ('Ознакомьтесь с тем как прикреплять фотографии документов.\n'
+                               '1. Нажать на скрепку\n' 
+                               '2. Выбрать файл\n' 
+                               '3. Нажать на «Выбрать из Галереи»\n'
+                               'Убедитесь, что фото сделаны в хорошем качестве и все поля читаемы\U0000203C\n\n'
+                               'Настоятельно рекомендуем присылать сканы документов в PDF формате\U0000203C\n\n'),
+                               reply_markup=markup)
+    memos = ['photo_memo_1.jpg', 'photo_memo_2.jpg']
+    for memo in memos:
+       bot.send_photo(chat_id, read_photo(memo))
+
+    return msg
 
 
-def process_dest_step(message):
+@decorator
+def process_dest_step(message, number, key):
     try:
-        chat_id = message.chat.id
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        letter = user.letters[number]
         dest = message.text
-        user = user_dict[chat_id]
-        user.letter.dest = dest
-        markup = create_markup(('Отменить', 'Пропустить'))
-        msg = bot.reply_to(message, ('Прикрепи необходимые документы '
-                                     '1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ)'),
-                           reply_markup=markup)
-        bot.register_next_step_handler(msg, process_content_step)
+        if dest == 'Завершить работу':
+            markup = create_markup(('Да', 'Нет'))
+            msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить?\n Все данные удалятся.', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_deletion_step, process_dest_step, 'Dest')
+            return
+        elif dest == 'Дальше':
+            user.number = number
+            user.key = 'CMR'
+            markup = create_markup(('Дальше', 'Изменить'))
+            msg = bot.send_message(message.chat.id, f'Проверьте правильность.\n Вложения по: 1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ):', reply_markup=markup)
+            send_all_dcouments(letter, message.chat.id, names, certain='CMR')
+            bot.register_next_step_handler(msg, process_cmr_step) 
+            return # go to dest step
+        elif dest == 'Изменить':
+            msg = bot.reply_to(message, ("Напишите пост назначения:"))
+            bot.register_next_step_handler(msg, process_dest_step)
+            return
+        dest = f"Пост назначения:: {dest}\n"
+        letter.body = letter.body + dest
+        if not letter.edit: 
+            user.number = number
+            user.key = 'CMR'
+            markup = create_markup(('Ознакомился', 'Завершить работу'))
+            msg = print_memo(message.chat.id, markup)
+            # msg = b#ot.reply_to(message, ('Инструкция здесь.'),
+            #             reply_markup=markup)
+            bot.register_next_step_handler(msg, process_memo_step)
+        else:
+            markup = create_markup(('Дальше', 'Изменить'))
+            msg = bot.send_message(message.chat.id, f'Проверьте правильность.\n Вложения по: 1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ):', reply_markup=markup)
+            send_all_dcouments(letter, message.chat.id, names, certain='CMR')
+            bot.register_next_step_handler(msg, process_cmr_step)
     except Exception as e:
         msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
                                      'Напишите пост назначения: ')
                            )
-        bot.register_next_step_handler(msg, process_dest_step)
+        #bot.register_next_step_handler(msg, process_dest_step, number)
 
 
-def process_confirm_step(message):
+def process_memo_step(message):
     try:
-        chat_id = message.chat.id
-        downloaded_file = read_photo(f"image_{chat_id}.jpg")
-        bot.send_photo(chat_id, downloaded_file)
-        # да - нет markup
-        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        btn_yes = types.KeyboardButton("Да")
-        markup.add(btn_yes)
-        btn_no = types.KeyboardButton('Нет')
-        markup.add(btn_no)
-        bot.send_message(message.chat.id, 'Это то самое фото?": ', reply_markup=markup)
+        if message.text == 'Ознакомился':
+            markup = create_markup(('Пропустить', 'Завершить работу'))
+            msg = bot.reply_to(message, ('Прикрепите необходимые документы.\n'
+                                        '\U0000203CНеобходимо прикреплять фото документов как вложения\U0000203C\n'
+                                        '1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ):'),
+                            reply_markup=markup)
+            bot.register_next_step_handler(msg, process_cmr_step)
+        elif message.text == 'Завершить работу':
+            markup = create_markup(('Да', 'Нет'))
+            msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить?\n Все данные удалятся.', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_deletion_step, process_memo_step, 'Memo')
+        else:
+            # TODO: test case
+            pass
     except Exception as e:
-        msg = bot.reply_to(message, 'Что-то пошло не так. Давай начнем заново.')
-        bot.register_next_step_handler(msg, process_confirm_step)
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Напишите пост назначения: ')
+                           )
 
-
-def process_telephone_step(message):
+def process_deletion_step(message, prev_step_handler, sort):
+    # TODO: to make a universal approach to src/dest/attach cancellation
     try:
-        chat_id = message.chat.id
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    except TypeError:
+        user_key, user = None, None
+    if message.text == 'Да' and sort in ('Telephone', 'Body', 'Src', 'Dest', 'Message', 'Memo'):
+        markup = create_markup(('Сформировать заявку', 'Обратная связь'))
+        if user:
+            if user.registered:
+                markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Заявки'))
+        bot.reply_to(message, f"Привет! Я ваш бот-помошник. Помогу быстро сформировать заявку.",
+                 reply_markup=markup)
+        try:
+            user.letters = []
+        except AttributeError:
+            pass
+    elif message.text == 'Да' and sort == 'Attachment':
+        del user.letters[user.number]
+        markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Завершить работу'))
+        bot.send_message(message.chat.id, 'Я удалил заявку. Выберите опцию ниже.', reply_markup=markup)
+    elif message.text == 'Нет' and sort == 'Attachment': 
+        bot.send_message(message.chat.id, 'Продолжим.')
+        # TODO: retrive all documents related to the step
+        markup = create_markup(('Пропустить', 'Завершить работу'))
+        msg = bot.reply_to(message, ('Прикрепите необходимые документы.\n'
+                                     f'{names[user.key]}'), reply_markup=markup)
+        bot.register_next_step_handler(msg, prev_step_handler)
+    elif message.text == 'Нет' and sort == 'Telephone':
+        bot.send_message(message.chat.id, 'Продолжим.')
+        markup = create_markup(('Завершить работу', ))
+        msg = bot.reply_to(message, "Напишите свой телефон для обратной связи:", reply_markup=markup)
+        bot.register_next_step_handler(msg, prev_step_handler)
+    elif message.text == 'Нет' and sort == 'Body': 
+        bot.send_message(message.chat.id, 'Продолжим.')
+        markup = create_markup(('Завершить работу', ))
+        msg = bot.reply_to(message, "Напишите то, что хотели бы передать:", reply_markup=markup)
+        bot.register_next_step_handler(msg, prev_step_handler)
+    elif message.text == 'Нет' and sort == 'Src':  
+        bot.send_message(message.chat.id, 'Продолжим.')
+        markup = create_markup(('Завершить работу', ))
+        msg = bot.reply_to(message, "Напишите пост отправления:" , reply_markup=markup)
+        bot.register_next_step_handler(msg, prev_step_handler)
+    elif message.text == 'Нет' and sort == 'Dest':  
+        bot.send_message(message.chat.id, 'Продолжим.')
+        markup = create_markup(('Завершить работу', ))
+        msg = bot.reply_to(message, 'Напишите пост назначения: ', reply_markup=markup)
+        bot.register_next_step_handler(msg, prev_step_handler)
+    elif message.text == 'Нет' and sort == 'Message':
+        bot.send_message(message.chat.id, 'Продолжим.')
+        markup = create_markup(('Отправить', 'Завершить работу'))
+        msg = bot.reply_to(message, 'Прикрепите вложения: ', reply_markup=markup)
+        bot.register_next_step_handler(msg, prev_step_handler)
+    elif message.text == 'Нет' and sort == 'Memo':  
+        bot.send_message(message.chat.id, 'Продолжим.')
+        markup = create_markup(('Ознакомился', 'Завершить работу'))
+        msg = msg = print_memo(message.chat.id, markup)
+        bot.register_next_step_handler(msg, prev_step_handler)
+
+
+def process_attach(message, number, key, next_key, user, document_name, next_step_handler, step_hndler):
+    if message.text == 'Завершить работу':
+        #del user.letters[number]
+        #markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Завершить работу'))
+        markup = create_markup(('Да', 'Нет'))
+        msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить?\n Все данные удалятся.', reply_markup=markup)
+        bot.register_next_step_handler(msg, process_deletion_step, step_hndler, 'Attachment')
+        return
+    elif message.text == 'Пропустить':
+        user.key = next_key
+        markup = create_markup(('Пропустить', 'Завершить работу'))
+        msg = bot.reply_to(message, ('Прикрепите необходимые документы.\n'
+                                     f'{document_name}'), reply_markup=markup)
+        bot.register_next_step_handler(msg, next_step_handler)
+        return
+    elif message.text == 'Продолжить':
+        user.key = next_key
+        if not user.letters[number].edit:
+            bot.clear_step_handler_by_chat_id(message.chat.id)
+            markup = create_markup(('Пропустить', 'Завершить работу'))
+            msg = bot.reply_to(message, ('Прикрепите необходимые документы.\n'
+                                    f'{document_name}'), reply_markup=markup)
+            bot.register_next_step_handler(msg, next_step_handler)
+        else:
+            markup = create_markup(('Дальше', 'Изменить'))
+            msg = bot.send_message(message.chat.id, f'Проверьте правильность.\n Вложения по {document_name}', reply_markup=markup)
+            send_all_dcouments(user.letters[number], message.chat.id, names, certain=next_key)
+            bot.register_next_step_handler(msg, next_step_handler)
+        return
+    elif message.text == 'Дальше':
+        user.key = next_key
+        markup = create_markup(('Дальше', 'Изменить'))
+        msg = bot.send_message(message.chat.id, f'Проверьте правильность.\n Вложения по {document_name}', reply_markup=markup)
+        send_all_dcouments(user.letters[number], message.chat.id, names, certain=next_key)
+        bot.register_next_step_handler(msg, next_step_handler)
+        return
+    elif message.text == 'Изменить':
+        user.letters[number].attachs[key] = []
+        markup = create_markup(('Дальше', 'Завершить работу'))
+        msg = bot.reply_to(message, ('Прикрепите необходимые документы.\n'
+                                    '\U0000203CНеобходимо прикреплять фото документов как вложения\U0000203C\n'
+                                    #f'{document_name}:'
+                                    ),
+                        reply_markup=markup)
+        bot.register_next_step_handler(msg, step_hndler)
+        return
+    letter = user.letters[number]
+    letter.update_attachs(message, bot, False, key)
+    if not user.letters[number].edit:
+        #if not message.media_group_id:
+        markup = create_markup(('Продолжить', 'Завершить работу')) 
+        bot.send_message(message.chat.id, 'Прикрепите еще вложение:', reply_markup=markup)
+        bot.register_next_step_handler(message, step_hndler)
+    else:
+        markup = create_markup(('Дальше', 'Завершить работу'))
+        bot.send_message(message.chat.id, 'Прикрепите еще вложение:', reply_markup=markup)
+        bot.register_next_step_handler(message, step_hndler)
+    #else:
+    #    answer = asyncio.create_task(setTimeout(5, func(message, step_hndler)))   
+    return 
+
+
+def func(message, step_hndler):
+    markup = create_markup(('Продолжить', 'Завершить работу')) 
+    bot.send_message(message.chat.id, 'Прикрепите еще вложение:', reply_markup=markup)
+    bot.register_next_step_handler(message, step_hndler)
+ 
+"""
+Обработать вложение для 1. CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ)
+"""
+@bot.message_handler(content_types=['document', 'photo', 'text'])
+@decorator
+def process_cmr_step(message, number, key):
+    # TODO: nultiple attachments: button and multi-message
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    try:
+        process_attach(message, number, key, 'Invoice', user, '2. ИНВОЙС:', process_invoice_step, process_cmr_step)
+    except AttributeError as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ):')
+                            )
+       #bot.register_next_step_handler(msg, process_cmr_step)
+        
+
+"""
+Обработать вложение для 2. ИНВОЙС
+"""
+@bot.message_handler(content_types=['document', 'photo'])
+@decorator
+def process_invoice_step(message, number, key):
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    try:
+        process_attach(message, number, key, 'Specific', user, '3. СПЕЦИФИКАЦИЮ (РАЗБИВКА С РУССКИМ ОПИСАНИЕМ):',
+                       process_spec_step, process_invoice_step)
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '2. ИНВОЙС:')
+                            )
+         #bot.register_next_step_handler(msg, process_invoice_step, number, 'Invoice')
+
+
+"""
+Обработать вложение для 3. СПЕЦИФИКАЦИЮ (РАЗБИВКА С РУССКИМ ОПИСАНИЕМ)
+"""
+@bot.message_handler(content_types=['document', 'photo'])
+@decorator
+def process_spec_step(message, number, key):
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    try:
+        process_attach(message, number, key, 'Packing', user, '4. ПАКИНГ ЛИСТ:',
+                       process_packing_step, process_spec_step)
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '3. СПЕЦИФИКАЦИЮ (РАЗБИВКА С РУССКИМ ОПИСАНИЕМ):')
+                            )
+         #bot.register_next_step_handler(msg, process_spec_step, number, 'Specific')
+
+
+"""
+Обработать вложение для 4. ПАКИНГ ЛИСТ
+"""
+@bot.message_handler(content_types=['document', 'photo'])
+@decorator
+def process_packing_step(message, number, key):
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    try:
+        process_attach(message, number, key, 'Driver', user, '5.ПАСПОРТ ВОДИТЕЛЯ:',
+                       process_driver_step, process_packing_step)
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '4. ПАКИНГ ЛИСТ:')
+                            )
+         #bot.register_next_step_handler(msg, process_packing_step, number, 'Packing')
+        
+
+"""
+Обработать вложение для 5. ПАСПОРТ ВОДИТЕЛЯ
+"""
+@bot.message_handler(content_types=['document', 'photo'])
+@decorator
+def process_driver_step(message, number, key):
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    try:
+        process_attach(message, number, key, 'Track', user, '6. ТЕХПАСПОРТ НА ТЯГАЧ:',
+                       process_track_step, process_driver_step)
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '5. ПАСПОРТ ВОДИТЕЛЯ:')
+                            )
+         #bot.register_next_step_handler(msg, process_driver_step, number, 'Driver')
+
+
+"""
+Обработать вложение для 6. ТЕХПАСПОРТ НА ТЯГАЧ
+"""
+@bot.message_handler(content_types=['document', 'photo'])
+@decorator
+def process_track_step(message, number, key):
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    try:
+        process_attach(message, number, key, 'Trailer', user, '7. ТЕХПАСПОРТ НА ПОЛУПРИЦЕП:',
+                       process_trailer_step, process_track_step)
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '6. ТЕХПАСПОРТ НА ТЯГАЧ:')
+                            )
+         #bot.register_next_step_handler(msg, process_track_step, number, 'Track')
+
+
+"""
+Обработать вложение для 7. ТЕХПАСПОРТ НА ПОЛУПРИЦЕП
+"""
+@bot.message_handler(content_types=['document', 'photo'])
+@decorator
+def process_trailer_step(message, number, key):
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    try:
+        process_attach(message, number, key, 'Permission', user, '8.СВИДЕТЕЛЬСТВО О ДОПУЩЕНИИ( СВИДЕТЕЛЬТВО ПОД ПЛОМБАМИ):',
+                       process_permision_step, process_trailer_step)
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '7. ТЕХПАСПОРТ НА ПОЛУПРИЦЕП:')
+                            )
+         #bot.register_next_step_handler(msg, process_trailer_step, number, 'Trailer')
+        
+
+"""
+Обработать вложение для 8. СВИДЕТЕЛЬСТВО О ДОПУЩЕНИИ( СВИДЕТЕЛЬТВО ПОД ПЛОМБАМИ)
+"""
+@bot.message_handler(content_types=['document', 'photo'])
+@decorator
+def process_permision_step(message, number, key):
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    try:
+        process_attach(message, number, key, 'Carrier', user, 
+                       ('9. СВИДЕТЕЛЬСТВО ТАМОЖЕННОГО ПЕРЕВОЗЧИКА \n'
+                        '( ЕСЛИ ТРАНЗИТ ПОД ТАМОЖЕННФМ ПЕРЕВОЗЧИКОМ)'),
+                       process_carrier_step, process_permision_step)
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '8. СВИДЕТЕЛЬСТВО О ДОПУЩЕНИИ( СВИДЕТЕЛЬТВО ПОД ПЛОМБАМИ):')
+                            )
+         #bot.register_next_step_handler(msg, process_permision_step, number, 'Permission')
+
+
+"""
+Обработать вложение для 9. СВИДЕТЕЛЬСТВО ТАМОЖЕННОГО ПЕРЕВОЗЧИКА 
+                           (ЕСЛИ ТРАНЗИТ ПОД ТАМОЖЕННФМ ПЕРЕВОЗЧИКОМ)
+"""
+@bot.message_handler(content_types=['document', 'photo'])
+@decorator
+def process_carrier_step(message, number, key):
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    if message.text == 'Завершить работу':
+        del user.letters[number]
+        markup = create_markup(('Сформировать заявку', 'Заявки', 'Завершить работу'))
+        bot.send_message(message.chat.id, 'Я удалил письмо.\nМожет начать заново.\nИли завершить работу.', reply_markup=markup)
+        return
+    elif message.text == 'Пропустить' or message.text == 'Продолжить':
+        # send all got files and its names
+        # TODO: document_name
+
+        letter = user.letters[number]
+        filtered_files = dict([item for item in letter.attachs.items() if item[1] is not None])
+        letter.attachs = filtered_files
+        if len(letter.attachs) != 0:
+            markup = create_markup(('Да', 'Нет, выбрать другие'))
+            bot.send_message(message.chat.id, 'Я получил такие документы:')
+            send_all_dcouments(letter, message.chat.id, names)
+            msg = bot.send_message(message.chat.id, 'Список документов верный?', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_confirm_step, number)
+        else:
+            #bot.send_message(message.chat.id, 'Вы не прикрепили ни одного вложения.')
+            #bot.send_message(message.chat.id, f'Заявка сформирована №{number + len(user.sent)}.')
+            #bot.send_message(message.chat.id, f'Заявка сформирована.')
+            #letters = user.letters
+            #list_letters = [f'Заявка #{index + len(user.sent)}' for index, val in enumerate(letters)]
+            #markup = create_markup(('Отправить заявку', 'Сформировать заявку', 'Текущие заявки', 'Отправленные заявки', *tuple(list_letters)))
+            #markup = create_markup(('Отправить заявку', 'Заявки', 'Завершить работу'))
+            #bot.send_message(message.chat.id, ('Теперь вы можете отправить заявку. \n'
+            #                                   'Кнопка "Оправить заявку" - отправит созданную заявку.\n'
+            #                                   'Кнопка "Зявки" - покажет все отправленные заявки.\n'),
+            #                reply_markup=markup)
+            send_ticket(message)
+            markup = create_markup(('Сформировать заявку', 'Заявки', 'Завершить работу'))
+            bot.send_message(message.chat.id, (#'Вы можете сформировать еще одну заявку.\n'
+                                            'Кнопка "Заявки" - покажет меню заявок.'),
+                            reply_markup=markup)
+        return
+    
+    elif message.text == 'Дальше':
+        letter = user.letters[number]
+        filtered_files = dict([item for item in letter.attachs.items() if item[1] is not None])
+        letter.attachs = filtered_files
+        if len(letter.attachs) != 0:
+            markup = create_markup(('Да', 'Нет, выбрать другие'))
+            bot.send_message(message.chat.id, 'Я получил такие документы:')
+            send_all_dcouments(letter, message.chat.id, names)
+            msg = bot.send_message(message.chat.id, 'Список документов верный?', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_confirm_step, number)
+        else:
+            bot.send_message(message.chat.id, 'Вы не прикрепили ни одного вложения.')
+            #bot.send_message(message.chat.id, f'Заявка сформирована №{number + len(user.sent)}.')
+            #bot.send_message(message.chat.id, f'Заявка изменена.')
+            #letters = user.letters
+            #list_letters = [f'Заявка #{index + len(user.sent)}' for index, val in enumerate(letters)]
+            #markup = create_markup(('Отправить заявку', 'Сформировать заявку', 'Текущие заявки', 'Отправленные заявки', *tuple(list_letters)))
+            send_ticket(message)
+            # markup = create_markup(('Отправить заявку', 'Завершить работу'))
+            # bot.send_message(message.chat.id, ('Теперь вы можете отправить заявку. \n'
+            #                                    'Кнопка "Оправить заявку" - отправит созданную заявку.\n'),
+            #                 reply_markup=markup)
+            markup = create_markup(('Сформировать заявку', 'Заявки', 'Завершить работу'))
+            bot.send_message(message.chat.id, (#'Вы можете сформировать еще одну заявку.\n'
+                                            'Кнопка "Заявки" - покажет меню заявок.'),
+                            reply_markup=markup)
+        return
+    try:
+        letter = user.letters[number]
+        letter.update_attachs(message, bot, False, key)
+        if not letter.edit: 
+            markup = create_markup(('Продолжить', 'Завершить работу')) 
+            bot.send_message(message.chat.id, 'Прикрепите еще вложение:', reply_markup=markup)
+            bot.register_next_step_handler(message, process_carrier_step)
+        else:
+            markup = create_markup(('Дальше', 'Завершить работу')) 
+            bot.send_message(message.chat.id, 'Прикрепите еще вложение:', reply_markup=markup)
+            bot.register_next_step_handler(message, process_carrier_step)
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давай начнем заново.\n'
+                                     'Прикрепи необходимые документы.\n'
+                                     '9. СВИДЕТЕЛЬСТВО ТАМОЖЕННОГО ПЕРЕВОЗЧИКА \n'
+                                     '( ЕСЛИ ТРАНЗИТ ПОД ТАМОЖЕННФМ ПЕРЕВОЗЧИКОМ)')
+                            )
+         #bot.register_next_step_handler(msg, process_carrier_step, number, 'Carrier')
+
+
+def send_all_dcouments(letter, chat_id,  names, certain=None):
+    if certain:
+        if certain in letter.attachs.keys():
+            for key, attach in letter.attachs.items():
+                if key == certain:
+                    if len(attach) != 0:
+                        for index, page in enumerate(attach):
+                            bot.send_document(chat_id, caption=names[key] + f' Стр. {index+1}', document=page[1])
+        else:
+            bot.send_message(chat_id, 'Без вложений')
+    else:
+        for key, attach in letter.attachs.items():
+            for index, page in enumerate(attach):
+                bot.send_document(chat_id, caption=names[key] + f' Стр. {index+1}', document=page[1])
+
+
+def send_ticket(message):
+    # сообщение: Ваше соообщение отправлено, наши специалисты скоро свяжутся с Вами.
+    user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+    #markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Отправленные заявки', 'Завершить работу'))
+    markup = create_markup(('Сформировать заявку',  'Заявки', 'Завершить работу'))
+    # SMTP send
+    list_senderrors = []
+    sent_number = len(user.sent)
+    for indx, letter in enumerate([letter for letter in user.letters if letter.sent == False]): # поменить номер заявки в пуле
+        #bot.send_message(message.chat.id, "Формирую заявку.")  # Отправляю
+        body = (f"Телефон: {user_key}\n"
+                f"{letter.body}\n")
+        # TODO: pythonic nested loop
+        files = []
+        for attach in letter.attachs.values():
+            for index, page in enumerate(attach):
+                page[0] = page[0] + f'_str_{index+1}'
+                files.append(page)
+
+        #files = list(page for page in attach for attach in letter.attachs.values())
+        if letter.edit:
+            mail_subj = f"Дополнение по {letter.sort} №{user.number} от User{message.chat.id}"
+        else:
+            mail_subj = f"{letter.sort} №{indx + sent_number} от User{message.chat.id}"
+        senderrors = send_mail(BOT_MAIL_ADDRESS, MAIL_ADDRESS, mail_subj, body, BOT_MAIL_PASS, files=files)
+        list_senderrors.append(senderrors) if senderrors is not {} else list_senderrors  
+        if not senderrors:
+            if letter.edit:
+                index = user.number
+            else:
+                index = indx + sent_number
+            bot.send_message(message.chat.id, f'Заявка №{index} успешно отправлена.')
+            letter.sent = True
+            if not letter.edit:
+                user.sent.append(letter)
+            else:
+                letter.edit = False
+                user.sent[user.number] = letter
+            #letter = None                    
+        else:
+            bot.send_message(message.chat.id, 'Не удалось отправить заявку.')
+    #user.letters = [letter for letter in user.letters if not letter.sent]
+    if list_senderrors: # list of dict
+        #bot.send_message(message.chat.id, 'Заявка(и) успешно отправлена(и). Скоро вернусь с ответом.',
+        #                    reply_markup=markup)
+        #bot.send_message(message.chat.id, ('Что будем делать дальше?\n'
+        #                                    '(Выберите опцию ниже)'),
+        #                    reply_markup=markup)
+        pass
+    else:
+        print('SMTP send errors: ', list_senderrors)
+        bot.send_message(message.chat.id, ('Что-то пошло не так. Давайте начнем заново.\n'
+                                            #'Выберите опцию...'
+                                           ),
+                            reply_markup=markup)
+
+def process_confirm_step(message, number):
+    try:
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        if message.text == 'Да':
+            if not user.letters[number].edit:
+                #bot.send_message(message.chat.id, f'Заявка сформирована.')
+                #bot.send_message(message.chat.id, f'Заявка сформирована №{number + len(user.sent)}.')
+                #letters = user.letters
+                #list_letters = [f'Заявка #{index + len(user.sent)}' for index, val in enumerate(letters)]
+                #markup = create_markup(('Отправить заявку', 'Сформировать заявку', 'Текущие заявки', 'Отправленные заявки', *tuple(list_letters)))
+                send_ticket(message)
+                markup = create_markup(('Сформировать заявку', 'Заявки', 'Завершить работу'))
+                bot.send_message(message.chat.id, (#'Вы можете сформировать еще одну заявку.\n'
+                                                'Кнопка "Заявки" - покажет меню заявок.'),
+                                reply_markup=markup)
+            else:
+                send_ticket(message)
+                #bot.send_message(message.chat.id, f'Заявка изменена.')
+                markup = create_markup(('Сформировать заявку', 'Заявки', 'Завершить работу'))
+                bot.send_message(message.chat.id, (#'Вы можете сформировать еще одну заявку.\n'
+                                                'Кнопка "Заявки" - покажет меню заявок.'),
+                                reply_markup=markup)
+        elif message.text == 'Нет, выбрать другие':
+            if not user.letters[number].edit: 
+                user.letters[number].attachs = {}
+                user.key = 'CMR'
+                markup = create_markup(('Пропустить','Завершить работу'))
+                msg = bot.reply_to(message, ('Прикрепите необходимые документы.\n'
+                                            '1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ):'),
+                            reply_markup=markup)
+                bot.register_next_step_handler(msg, process_cmr_step)
+            else:
+                markup = create_markup(('Дальше', 'Изменить'))
+                user.key = 'CMR'
+                msg = bot.send_message(message.chat.id, f'Проверьте правильность.\n Вложения по: 1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ):', reply_markup=markup)
+                send_all_dcouments(user.letters[number], message.chat.id, names, certain='CMR')
+                bot.register_next_step_handler(msg, process_cmr_step)
+        elif message.text == 'Нет':
+            user.letters[number].attachs = {}
+            user.key = 'Attach'
+            markup = create_markup(('Пропустить','Завершить работу'))
+            msg = bot.reply_to(message, ('Прикрепите необходимые документы.\n'
+                                         '1.CMR (ТРАНСПОРТНАЯ НАКЛАДНАЯ):'),
+                           reply_markup=markup)
+            bot.register_next_step_handler(msg, process_cmr_step)
+    except Exception as e:
+        msg = bot.reply_to(message, 'Что-то пошло не так. Давайте начнем заново.')
+        #bot.register_next_step_handler(msg, process_confirm_step)
+
+
+def process_telephone_step(message, prev_message=None):
+    try:
         telephone = message.text
-        if not str(telephone).isdigit():
-            msg = bot.reply_to(message, ('Некорректный телефон. Попробуйте еще раз. \n'
-                                         'Напишите еще раз свой номер телефона (только цифры, без +):')
-                               )
-            bot.register_next_step_handler(msg, process_telephone_step)
+        if telephone == 'Завершить работу':
+            markup = create_markup(('Да', 'Нет'))
+            msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить ввод телефона?\n Все данные удалятся.', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_deletion_step, process_telephone_step, 'Telephone')
             return
-        user = User(None, phone=telephone, registered=False)
-        user_dict.update({chat_id: user})
-        msg = bot.reply_to(message, 'Напишите то, что хотели бы передать:')
-        bot.register_next_step_handler(msg, process_body_step)
+        elif re.match('[-+]?\d{9,}', telephone) is None:
+            msg = bot.reply_to(message, ('Некорректный телефон. Попробуйте еще раз. \n'
+                                         'Напишите еще раз свой номер телефона: \n'
+                                         '(Подсказка: только цифры, не менее 9 цифр)')
+                               )
+            bot.register_next_step_handler(msg, process_telephone_step, prev_message=prev_message)
+            return
+        # go to DATAVASE for telephone number
+        user = conn.curs(f"SELECT * FROM users WHERE phone='{telephone}';")
+        registered = True if user is not None else False
+        if telephone not in user_dict.keys(): 
+            user_dict[telephone] = User(telephone, registered=registered)
+            if message.chat.id not in user_dict[telephone].chat_ids:
+                user_dict[telephone].chat_ids.add(message.chat.id)
+        elif user:
+            user_dict[telephone].registered = True
+
+        if prev_message.text == 'Обратная связь' and user is None:
+            reply = ("Вы пока не зарегистрированы.\n"
+                     'Напишите то, что хотели бы передать:')
+            msg = bot.reply_to(message, reply)
+            bot.register_next_step_handler(msg, process_body_step)
+        elif prev_message.text == 'Обратная связь' and user:
+            reply = 'Напишите то, что хотели бы передать:'
+            msg = bot.reply_to(message, reply)
+            bot.register_next_step_handler(msg, process_body_step)
+        elif prev_message.text == 'Сформировать заявку' and user is None:
+            reply = ("Мы не нашли вас в нашей базе. Формирование заявки недоступно.\n"
+                     'Ниже можете написать нам информацию о себе и мы свяжемся с вами.')
+            msg = bot.reply_to(message, reply)
+            bot.register_next_step_handler(msg, process_body_step)
+        elif prev_message.text == 'Сформировать заявку' and user:
+            msg = bot.reply_to(message, 'Напишите пост отправления:')
+            bot.register_next_step_handler(msg, process_src_step)
+       
+
     except Exception as e:
         msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
-                                     "Напишите еще раз:")
+                                     "Напишите еще раз телефон:\n"
+                                     '(Подсказка: только цифры, не менее 9 цифр)')
                            )
-        bot.register_next_step_handler(msg, process_telephone_step)
+        bot.register_next_step_handler(msg, process_telephone_step, prev_message=prev_message)
 
+
+
+def get_user_by_chat_id(user_dict, chat_id):
+    for key in user_dict.keys():
+        if chat_id in user_dict[key].chat_ids:
+            return key, user_dict[key]
 
 def process_body_step(message):
     try:
-        chat_id = message.chat.id
         body = message.text
-        letter = Letter(src=None)
-        letter.body = body
-        user_dict[chat_id].letter = letter
-        markup = create_markup(('Отправить без вложений', 'Прикрепить'))
-        bot.send_message(chat_id, 'Прикрепить вложениe?', reply_markup=markup)
+        if body == 'Завершить работу':
+            markup = create_markup(('Да', 'Нет'))
+            msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить?\n Все данные удалятся.', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_deletion_step, process_body_step, 'Body')
+            return
+        letter = Letter(body=body, sort='Сообщение')
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        user.letters.insert(len(user.sent) + len(user.letters), letter)
+        markup = create_markup(('Отправить', 'Завершить работу'))
+        msg = bot.reply_to(message, "Прикрепите вложение:", reply_markup=markup)
+        user.number = -1
+        user.key = 'Attach'
+        bot.register_next_step_handler(msg, process_attach_step)
+        #bot.send_message(message.chat.id, 'Прикрепить вложениe?', reply_markup=markup)
     except Exception as e:
         msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
-                                     "Напишите еще раз:")
+                                     "Напишите еще раз, то что требуется отправить:")
                            )
-        bot.register_next_step_handler(msg, process_body_step)
+        #bot.register_next_step_handler(msg, process_body_step)
 
 
 @bot.message_handler(content_types=['document', 'photo'])
-def process_attach_step(message):
+@decorator
+def process_attach_step(message, number, key):
     try:
-        chat_id = message.chat.id
-        user = user_dict[chat_id]
-        key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        if update_attachs(message, user, key, 'вложение', False, process_attach_step):
-            return
-        markup = create_markup(('Отправить', 'Прикрепить'))
-        bot.send_message(chat_id, 'Прикрепить еще вложениe?', reply_markup=markup)
+        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+        letter = user.letters[number]
+        if message.text == 'Отправить': 
+        # сообщение: Ваше соообщение отправлено, наши специалисты скоро свяжутся с Вами.
+        #user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+            if user.registered:
+                from_user = ''
+                markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Завершить работу'))
+            else:
+                from_user = 'Новый пользователь! '
+                #markup = create_markup(('Обратная связь', 'Завершить работу'))
+                markup = create_markup(('Завершить работу', ))
+            # SMTP send
+            list_senderrors = []
+            sent_number = len(user.sent)
+            for indx, letter in enumerate([letter for letter in user.letters if letter.sort == 'Сообщение']): # поменить номер заявки в пуле
+                # process 
+                bot.send_message(message.chat.id, "Отправляю Ваше сообщение.") 
+                body = f'\nТелефон: {user_key}\n' + letter.body  # body is NoneType?
+                files = []
+                for attach in letter.attachs.values():
+                    for index, page in enumerate(attach):
+                        page[0] = page[0] + f'_str_{index+1}'
+                        files.append(page)
+                mail_subj = f"{from_user}{letter.sort} №{sent_number+indx} от User{message.chat.id}"
+                senderrors = send_mail(BOT_MAIL_ADDRESS, MAIL_ADDRESS, mail_subj, body, BOT_MAIL_PASS, files)
+                list_senderrors.append(senderrors) if senderrors is not {} else list_senderrors  
+                if not senderrors:
+                    bot.send_message(message.chat.id, f'Сообщение №{sent_number+indx} успешно отправлено.')
+                    sent_letter = user.letters.pop(indx)
+                    user.sent.append(sent_letter)
+                else:
+                    bot.send_message(message.chat.id, 'Не удалось отправить сообщение.')
+            if list_senderrors:
+                bot.send_message(message.chat.id, 'Сообщения(е) успешно отправлены(о). Скоро вернусь с ответом.',
+                                reply_markup=markup)
+                #bot.send_message(message.chat.id, ('Что будем делать дальше?\n'
+                #                                   '(Выберите опцию ниже)'),
+                #                 reply_markup=markup)
+            else:
+                print('SMTP send errors: ', list_senderrors)
+                bot.send_message(message.chat.id, ('Что-то пошло не так. Давайте начнем заново.\n'
+                                                'Выберите опцию...'),
+                                reply_markup=markup)
+            return 
+        elif  message.text == 'Завершить работу':
+            markup = create_markup(('Да', 'Нет'))
+            msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить?\n Все данные удалятся.', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_deletion_step, process_attach_step, 'Message')
+            return            
+        letter.update_attachs(message, bot, False, key)
+        markup = create_markup(('Отправить', 'Завершить работу'))
+        msg = bot.send_message(message.chat.id, 'Прикрепите еще вложениe:', reply_markup=markup)
+        bot.register_next_step_handler(msg, process_attach_step)
     except Exception as e:
         msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
                                      'Прикрепите вложение:')
                            )
-        bot.register_next_step_handler(msg, process_attach_step)
+        #bot.register_next_step_handler(msg, process_attach_step, number, key)
 
 
 def process_phone_step(message):
@@ -390,9 +1264,13 @@ def send_mail(send_from, send_to, subject, text, password, files=None,
 
     # TODO: either photo or document
     for file_tuple in files:
-        attach = MIMEApplication(file_tuple[1])
-        attach.add_header('content-disposition', 'attachment', filename=file_tuple[0])
-        msg.attach(attach)
+        if file_tuple[2] == 'doc':
+            attach = MIMEApplication(file_tuple[1])
+            attach.add_header('content-disposition', 'attachment', filename=file_tuple[0])
+            msg.attach(attach)
+        else:
+            attach = MIMEImage(file_tuple[1], name=file_tuple[0])
+            msg.attach(attach)
 
     with smtplib.SMTP(server, port) as server:
         server.ehlo()
@@ -405,13 +1283,12 @@ def send_mail(send_from, send_to, subject, text, password, files=None,
 
 bot.enable_save_next_step_handlers(delay=2)
 
-
 # Load next_step_handlers from save file (default "./.handlers-saves/step.save")
 # WARNING It will work only if enable_save_next_step_handlers was called!
 bot.load_next_step_handlers()
 
-bot.infinity_polling()
-
+#bot.infinity_polling()
+bot.polling(none_stop=True)
 
 # Handle all sent photos of type 'image/jpeg' and 'image/png'.
 # @bot.message_handler(func=lambda message: message.document.mime_type in ('image/png', 'image/jpeg'),

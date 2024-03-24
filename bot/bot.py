@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from functools import wraps
 load_dotenv()
 
+logging.basicConfig(format='%(asctime)s %(message)s',datefmt='%d-%m-%Y %H:%M:%S',level=logging.INFO)
+
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 MAIL_ADDRESS = os.getenv('MAIL_ADDRESS')
@@ -76,23 +78,24 @@ def decorator(func):
             user_key, user = get_user_by_chat_id(user_dict, args[0].chat.id)
         except TypeError:
             logging.warning(f'User with chat id {args[0].chat.id} not found in users dictionary. Function call: {func.__name__}')
-        else: 
-            return func(*args, user, **kwargs)
+            #user = User(registered=False)
+            #user.phone = None
+            #user.chat_ids = args[0].chat.id
+            #user_dict[args[0].chat.id] = user
+            user = None 
+        return func(*args, user, **kwargs)
     return wrap
 
 # START HERE
 @bot.message_handler(commands=['help', 'start'])
-def start(message):
-    try:
-        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-    except TypeError:
-        user_key, user = None, None
+@decorator
+def start(message, user):
     markup = create_markup(('Сформировать заявку', 'Обратная связь'))
-    if user:
+    try:
         if user.registered:
             markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Заявки'))
-    # 2 кнопки - Обратная связь и Сформировать заявку
-    # Промпт телефон для Сформировать заявку -> есть возможность создавать заявки
+    except AttributeError:
+        markup = create_markup(('Сформировать заявку', 'Обратная связь'))
     bot.reply_to(message, f"Привет! Я ваш бот-помошник. Помогу быстро сформировать заявку.",
                  reply_markup=markup)
 
@@ -108,69 +111,51 @@ def get_string(stroka, beg_str):
 
 # Handle all sent text messages.
 @bot.message_handler(content_types=['text'])
-def get_text_message(message):
+@decorator
+def get_text_message(message, user):
     if message.text == 'Обратная связь':
-        try:
-            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-        except TypeError:
-            user_key, user = None, None
         markup = create_markup(('Завершить работу', ))
-        if user is None or not user.registered:
-            msg = bot.reply_to(message, (#"Можете написать нам письмо, "
-                                        #"и специалисты свяжутся с вами в ближайшее время!\n"
-                                    # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
-                                        "Напишите свой телефон для обратной связи:"), reply_markup=markup)
-            bot.register_next_step_handler(msg, process_telephone_step, prev_message=message)
-        #elif user:
-        else: 
-            msg = bot.reply_to(message, (#"Можете написать нам письмо, "
-                                        #"и специалисты свяжутся с вами в ближайшее время!\n"
-                                        # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
-                                        "Напишите то, что хотели бы передать:"), reply_markup=markup)
-            bot.register_next_step_handler(msg, process_body_step)
-    #elif message.text == 'Прикрепить':
-    #    msg = bot.reply_to(message, "Прикрепите вложение:")
-    #    bot.register_next_step_handler(msg, process_attach_step, -1, None)
-    elif message.text == 'Завершить работу':
         try:
-            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-        except TypeError:
-            user_key, user = None, None
+            if not user.registered:
+                msg = bot.reply_to(message, 
+                                ("Напишите свой телефон для обратной связи:"), reply_markup=markup)
+                bot.register_next_step_handler(msg, process_telephone_step, prev_message=message)
+            elif user.registered:
+                msg = bot.reply_to(message, 
+                                ("Напишите то, что хотели бы передать:"), reply_markup=markup)
+                bot.register_next_step_handler(msg, process_body_step)
+        except AttributeError:
+            msg = bot.reply_to(message, 
+                                ("Напишите свой телефон для обратной связи:"), reply_markup=markup)
+            bot.register_next_step_handler(msg, process_telephone_step, prev_message=message)
+    elif message.text == 'Завершить работу':
         markup = create_markup(('Сформировать заявку', 'Обратная связь'))
-        if user:
+        try:
             if user.registered:
                 markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Заявки'))
-        
-        bot.send_message(message.chat.id, ('До скорого.\n'
-                                           #'Если Вам что-то понадобится, нажмите: /start\n'
-                                           #'(конпку типа сделать)'
-                                           ))
-        msg = bot.send_message(message.chat.id, "Привет! Я ваш бот-помошник. Помогу быстро сформировать заявку.", reply_markup=markup)
-        #bot.register_next_step_handler(msg, start)
-
+        except AttributeError:
+            markup = create_markup(('Сформировать заявку', 'Обратная связь'))
+        bot.send_message(message.chat.id, ('До скорого.\n'))
+        msg = bot.send_message(message.chat.id,
+                                "Привет! Я ваш бот-помошник. Помогу быстро сформировать заявку.",
+                                  reply_markup=markup)
     elif message.text == 'Сформировать заявку':
-        try:
-            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-        except TypeError:
-            user_key, user = None, None
         markup = create_markup(('Завершить работу', ))
-        if user is None or (user and not user.registered):
+        try:
+            if not user.registered:
+                msg = bot.reply_to(message, (f"Прежде чем начать, напишите свой номер телефона.\n"),
+                                reply_markup=markup)
+                bot.register_next_step_handler(msg, process_telephone_step, prev_message=message)
+            elif user.registered:
+                msg = bot.reply_to(message, ("Приступим к формированию заявки!\n"
+                                            # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
+                                            "Напишите пост отправления:"), reply_markup=markup)
+                user.number = None
+                bot.register_next_step_handler(msg, process_src_step)
+        except AttributeError:
             msg = bot.reply_to(message, (f"Прежде чем начать, напишите свой номер телефона.\n"),
-                                         #f"Номер телефона:")
                             reply_markup=markup)
             bot.register_next_step_handler(msg, process_telephone_step, prev_message=message)
-        elif user and user.registered:
-            msg = bot.reply_to(message, ("Приступим к формированию заявки!\n"
-                                        # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
-                                        "Напишите пост отправления:"), reply_markup=markup)
-            user.number = None
-            bot.register_next_step_handler(msg, process_src_step)
-        #elif :
-        #    msg = bot.reply_to(message, (#"Вам пока не дали доступ, но Вы можете написать нам письмо, "
-        #                                 #"и специалисты свяжутся с вами в ближайшее время!\n"
-        #                            # "Если Вы по другому вопросу, то можете написать мне, я отправлю его оператору.\n"
-        #                                 "Напишите то, что хотели бы передать:"))
-        #    bot.register_next_step_handler(msg, process_body_step)
     elif message.text == 'Изменить заявку аываыва':
         user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
         try:
@@ -188,11 +173,6 @@ def get_text_message(message):
         user.number = number
         bot.register_next_step_handler(msg, process_src_step)
     elif message.text == 'Изменить заявку':
-        try:
-            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-        except TypeError:
-            user_key, user = None, None
-
         list_letters = [f'Заявка #{index}' for index, val in enumerate(user.sent) if val.sort == 'Заявка']
         markup = create_markup((*tuple(list_letters), 'Назад'))
         if list_letters != []:
@@ -200,7 +180,6 @@ def get_text_message(message):
         else:
             bot.send_message(message.chat.id, 'У вас пока нет отпрваленных заявок', reply_markup=markup)
     elif re.match('Заявка #\d+', message.text):
-        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
         matching = re.search(r'\d+', message.text)
         number = int(matching.group())
         user.number = number
@@ -215,30 +194,23 @@ def get_text_message(message):
         bot.register_next_step_handler(msg, process_src_step)
     elif message.text == 'Заявки':
         try:
-            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-        except TypeError:
-            user_key, user = None, None
-        if user:
-            markup = create_markup(('Изменить заявку', 'Все заявки','Назад'))
-        else:
+            if user.registered:
+                markup = create_markup(('Изменить заявку', 'Все заявки','Назад'))
+            else:
+                markup = create_markup(('Назад', ))
+        except AttributeError:
             markup = create_markup(('Назад', ))
         bot.send_message(message.chat.id, ('Кнопка "Все заявки" - покажет все завяки\n'
                                            'Кнопка "Изменить заявку" - позволит изменить заявку'), reply_markup=markup)
     elif message.text == 'Назад':
-        try:
-            user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-        except TypeError:
-            user_key, user = None, None
         markup = create_markup(('Сформировать заявку', 'Обратная связь'))
-        if user:
+        try:
             if user.registered:
                 markup = create_markup(('Сформировать заявку', 'Обратная связь', 'Заявки'))
+        except AttributeError:
+            markup = create_markup(('Сформировать заявку', 'Обратная связь'))
         msg = bot.send_message(message.chat.id, "Привет! Я ваш бот-помошник. Помогу быстро сформировать заявку.", reply_markup=markup)
     elif message.text == 'Все заявки':
-        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-        #list_letters = [f'Заявка #{index}' for index, val in enumerate(user.sent)]
-        #markup = create_markup(('Отправить заявку', 'Сформировать заявку', 'Текущие заявки', 'Отправленные заявки'))
-        
         markup = create_markup(('Изменить заявку', 'Все заявки','Завершить работу'))
         if user.sent != []:
             bot.send_message(message.chat.id, 'Ваши отправленные заявки:')
@@ -302,7 +274,6 @@ def get_text_message(message):
         msg = bot.reply_to(message, "Давайте начнем сначала.\nYНапишите пост отправления: ")
         bot.register_next_step_handler(msg, process_content_step)
     elif re.match('Изменить заявку#\d+', message.text):
-        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
         matching = re.search(r'\d+', message.text)
         try:
             number = int(matching.group()) - len(user.sent)
@@ -532,6 +503,7 @@ def print_memo(chat_id, markup):
                                'Убедитесь, что фото сделаны в хорошем качестве и все поля читаемы\U0000203C\n\n'
                                'Настоятельно рекомендуем присылать сканы документов в PDF формате\U0000203C\n\n'),
                                reply_markup=markup)
+    # TODO: relative path -> env path (absolute)
     memos = ['photo_memo_1.jpg', 'photo_memo_2.jpg']
     for memo in memos:
        bot.send_photo(chat_id, read_photo(memo))
@@ -542,7 +514,6 @@ def print_memo(chat_id, markup):
 @decorator
 def process_dest_step(message, user):
     try:
-        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
         letter = user.letters[user.number]
         dest = message.text
         if dest == 'Завершить работу':
@@ -749,7 +720,8 @@ def process_attach(message, next_key, user, document_name, next_step_handler, st
             #markup = create_markup(('Следующий документ', 'Прикрепить еще страницу', 'Завершить работу'), presists=True)
             markup = create_markup(('Следующий документ', 'Завершить работу'), presists=True) 
             if message.media_group_id is not None:
-                start_timer(bot, message, markup, step_hndler)
+                start_timer(bot, message, markup, ('Файлы загружены. \n' 
+                      'Отправьте еще или нажмите "Следующий документ".'), step_hndler)
             else:
                 #bot.send_message(message.chat.id, 'Прикрепите еще вложение:', reply_markup=markup)
                 bot.register_next_step_handler(message, step_hndler)
@@ -759,7 +731,8 @@ def process_attach(message, next_key, user, document_name, next_step_handler, st
         else:
             markup = create_markup(('Дальше', 'Завершить работу'))
             if message.media_group_id is not None:        
-                start_timer(bot, message, markup, step_hndler)
+                start_timer(bot, message, markup, ('Файлы загружены. \n' 
+                      'Отправьте еще или нажмите "Следующий документ".'), step_hndler)
             else:
                 #bot.send_message(message.chat.id, 'Прикрепите еще вложение:', reply_markup=markup)
                 bot.register_next_step_handler(message, step_hndler)
@@ -781,22 +754,22 @@ def process_attach(message, next_key, user, document_name, next_step_handler, st
 
 
 timer = None
-def start_timer(bot, message, markup, func_step):     
+def start_timer(bot, message, markup, message_body, func_step):     
     global timer
     if timer is None:
         #bot.send_message(message.chat.id, 'Подождите.')
-        timer = threading.Timer(0.5, step_print, args=[bot, message, markup, func_step])
+        timer = threading.Timer(0.5, step_print,
+                                 args=[bot, message, markup, message_body,func_step]
+        )
         timer.start()
     else:
         print('Timer already started')
 
 
-def step_print(bot, message, markup, func_step):
+def step_print(bot, message, markup, message_body, func_step):
     global timer
     bot.register_next_step_handler(message, func_step)
-    bot.send_message(message.chat.id, 
-                     ('Файлы загружены. \n' 
-                      'Отправьте еще или нажмите "Следующий документ".'), reply_markup=markup)
+    bot.send_message(message.chat.id, message_body, reply_markup=markup)
     print('Я здесь')
     timer = None
 
@@ -1172,75 +1145,118 @@ def process_confirm_step(message, number):
         msg = bot.reply_to(message, 'Что-то пошло не так. Давайте начнем заново.')
         #bot.register_next_step_handler(msg, process_confirm_step)
 
-
-def process_telephone_step(message, prev_message=None):
+@decorator
+def process_telephone_step(message, user, prev_message=None):
     try:
         telephone = message.text
+    except AttributeError as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
+                                     "Напишите еще раз телефон:\n"
+                                     '(Подсказка: цифры, не менее 9 цифр, символы +, -)')
+                           )
+        bot.register_next_step_handler(msg, process_telephone_step, prev_message=prev_message)
+    else:
         if telephone == 'Завершить работу':
             markup = create_markup(('Да', 'Нет'))
             msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить ввод телефона?\n Все данные удалятся.', reply_markup=markup)
             bot.register_next_step_handler(msg, process_deletion_step, process_telephone_step, 'Telephone')
-            return
         elif re.match('[-+]?\d{9,}', telephone) is None:
             msg = bot.reply_to(message, ('Некорректный телефон. Попробуйте еще раз. \n'
                                          'Напишите еще раз свой номер телефона: \n'
                                          '(Подсказка: только цифры, не менее 9 цифр)')
                                )
             bot.register_next_step_handler(msg, process_telephone_step, prev_message=prev_message)
-            return
-        # go to DATAVASE for telephone number
-        user = conn.curs(f"SELECT * FROM users WHERE phone='{telephone}';")
-        registered = True if user is not None else False
-        if telephone not in user_dict.keys(): 
-            user_dict[telephone] = User(telephone, registered=registered)
-            if message.chat.id not in user_dict[telephone].chat_ids:
-                user_dict[telephone].chat_ids.add(message.chat.id)
-        elif user:
-            user_dict[telephone].registered = True
+        else:
+            # check if message.chat.id exists in user_dict if not add a user
+            try: 
+                user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
+                if user_key != telephone:
+                    logging.info((f'User №{message.chat.id} changed telephone {user_key} '
+                              f'to telephone {telephone}.'))
+                    user_dict[telephone] = user_dict.pop(user_key)
+                if message.chat.id != user_dict[telephone].chat_ids:
+                    logging.info((f'An attempt to abuse telephone {telephone} '
+                                f'registered to user №{user_dict[telephone].chat_ids} ' 
+                                f'by user №{message.chat.id}.'
+                                ))
+                    bot.send_message(message.chat.id, ('Этот номер уже используется в другом телеграмм акаунте.\n'
+                                                    'Если хотите продолжить работу в этом акаунте сообщите нам, '
+                                                    'используя форму обратной связи.'))
+                    markup = create_markup(('Сформировать заявку', 'Обратная связь'))
+                    bot.reply_to(message, 
+                                (f"Привет! Я ваш бот-помошник."
+                                "Помогу быстро сформировать заявку."),
+                                reply_markup=markup)
+                    return
+            except TypeError:
+                if telephone not in user_dict.keys():
+                    user = User(phone=telephone, registered=False)
+                    user.chat_ids = message.chat.id
+                    user_dict[telephone] = user
+                    logging.info((f'Created user №{message.chat.id} '
+                                f'and telephone {telephone}.'))
+                else:
+                    logging.info((f'An attempt to abuse telephone {telephone} '
+                              f'registered to user №{user_dict[telephone].chat_ids} ' 
+                              f'by user №{message.chat.id}.'
+                              ))
+                    bot.send_message(message.chat.id, ('Этот номер уже используется в другом телеграмм акаунте.\n'
+                                                'Если хотите продолжить работу в этом акаунте сообщите нам, '
+                                                'используя форму обратной связи.'))
+                    markup = create_markup(('Сформировать заявку', 'Обратная связь'))
+                    bot.reply_to(message, 
+                            (f"Привет! Я ваш бот-помошник."
+                            "Помогу быстро сформировать заявку."),
+                            reply_markup=markup)
+                    return
+            #if telephone not in user_dict.keys():   
 
-        if prev_message.text == 'Обратная связь' and user is None:
-            reply = ("Вы пока не зарегистрированы.\n"
-                     'Напишите то, что хотели бы передать:')
-            msg = bot.reply_to(message, reply)
-            bot.register_next_step_handler(msg, process_body_step)
-        elif prev_message.text == 'Обратная связь' and user:
-            reply = 'Напишите то, что хотели бы передать:'
-            msg = bot.reply_to(message, reply)
-            bot.register_next_step_handler(msg, process_body_step)
-        elif prev_message.text == 'Сформировать заявку' and user is None:
-            reply = ("Мы не нашли вас в нашей базе. Формирование заявки недоступно.\n"
-                     'Ниже можете написать нам информацию о себе и мы свяжемся с вами.')
-            msg = bot.reply_to(message, reply)
-            bot.register_next_step_handler(msg, process_body_step)
-        elif prev_message.text == 'Сформировать заявку' and user:
-            msg = bot.reply_to(message, 'Напишите пост отправления:')
-            bot.register_next_step_handler(msg, process_src_step)
-       
-
-    except Exception as e:
-        msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
-                                     "Напишите еще раз телефон:\n"
-                                     '(Подсказка: только цифры, не менее 9 цифр)')
-                           )
-        bot.register_next_step_handler(msg, process_telephone_step, prev_message=prev_message)
-
+            if prev_message.text == 'Обратная связь':
+                reply = 'Напишите то, что хотели бы передать:'
+                msg = bot.reply_to(message, reply)
+                bot.register_next_step_handler(msg, process_body_step)
+            elif prev_message.text == 'Сформировать заявку':
+                # go to DATAVASE for telephone number: verification
+                db_user = conn.curs(f"SELECT * FROM users WHERE phone='{telephone}';")
+                if db_user:
+                    if not user_dict[telephone].registered:
+                        logging.info(f'New registered user №{user_dict[telephone].chat_ids} '
+                                 f'and telephone {telephone}')
+                        user_dict[telephone].registered = True
+                    msg = bot.reply_to(message, 'Напишите пост отправления:')
+                    user.number = None
+                    bot.register_next_step_handler(msg, process_src_step)
+                else:
+                    logging.info(f'Database not found user №{user_dict[telephone].chat_ids} '
+                                 f'and telephone {telephone}')
+                    reply = ("Мы не нашли вас в нашей базе. Формирование заявки недоступно.\n"
+                            'Ниже можете написать нам информацию о себе и мы свяжемся с вами.')
+                    msg = bot.reply_to(message, reply)
+                    bot.register_next_step_handler(msg, process_body_step)
+                
 
 
 def get_user_by_chat_id(user_dict, chat_id):
     for key in user_dict.keys():
-        if chat_id in user_dict[key].chat_ids:
+        if chat_id == user_dict[key].chat_ids:
             return key, user_dict[key]
 
-def process_body_step(message):
+@decorator
+def process_body_step(message, user):
     try:
         body = message.text
+    except Exception as e:
+        msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
+                                     "Напишите еще раз, то что требуется отправить:")
+                           )
+        #bot.register_next_step_handler(msg, process_body_step)
+    else:
         if body == 'Завершить работу':
             markup = create_markup(('Да', 'Нет'))
             msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить?\n Все данные удалятся.', reply_markup=markup)
             bot.register_next_step_handler(msg, process_deletion_step, process_body_step, 'Body')
             return
         letter = Letter(body=body, sort='Сообщение')
-        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
         user.letters.insert(len(user.sent) + len(user.letters), letter)
         markup = create_markup(('Отправить', 'Завершить работу'))
         msg = bot.reply_to(message, "Прикрепите вложение:", reply_markup=markup)
@@ -1248,19 +1264,14 @@ def process_body_step(message):
         user.key = 'Attach'
         bot.register_next_step_handler(msg, process_attach_step)
         #bot.send_message(message.chat.id, 'Прикрепить вложениe?', reply_markup=markup)
-    except Exception as e:
-        msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
-                                     "Напишите еще раз, то что требуется отправить:")
-                           )
-        #bot.register_next_step_handler(msg, process_body_step)
+    
 
 
 @bot.message_handler(content_types=['document', 'photo'])
 @decorator
-def process_attach_step(message, number, key):
+def process_attach_step(message, user):
     try:
-        user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
-        letter = user.letters[number]
+        letter = user.letters[user.number]
         if message.text == 'Отправить': 
         # сообщение: Ваше соообщение отправлено, наши специалисты скоро свяжутся с Вами.
         #user_key, user = get_user_by_chat_id(user_dict, message.chat.id)
@@ -1273,11 +1284,12 @@ def process_attach_step(message, number, key):
                 markup = create_markup(('Завершить работу', ))
             # SMTP send
             list_senderrors = []
-            sent_number = len(user.sent)
+            #sent_number = len(user.sent)
+            sent_number = 0
             for indx, letter in enumerate([letter for letter in user.letters if letter.sort == 'Сообщение']): # поменить номер заявки в пуле
                 # process 
                 bot.send_message(message.chat.id, "Отправляю Ваше сообщение.") 
-                body = f'\nТелефон: {user_key}\n' + letter.body  # body is NoneType?
+                body = f'\nТелефон: {user.phone}\n' + letter.body  # body is NoneType?
                 files = []
                 for attach in letter.attachs.values():
                     for index, page in enumerate(attach):
@@ -1292,27 +1304,34 @@ def process_attach_step(message, number, key):
                     user.sent.append(sent_letter)
                 else:
                     bot.send_message(message.chat.id, 'Не удалось отправить сообщение.')
-            if list_senderrors:
-                bot.send_message(message.chat.id, 'Сообщения(е) успешно отправлены(о). Скоро вернусь с ответом.',
-                                reply_markup=markup)
+            #if list_senderrors:
+                #bot.send_message(message.chat.id, 'Сообщения(е) успешно отправлены(о). Скоро вернусь с ответом.',
+                #                reply_markup=markup)
                 #bot.send_message(message.chat.id, ('Что будем делать дальше?\n'
                 #                                   '(Выберите опцию ниже)'),
                 #                 reply_markup=markup)
-            else:
-                print('SMTP send errors: ', list_senderrors)
-                bot.send_message(message.chat.id, ('Что-то пошло не так. Давайте начнем заново.\n'
-                                                'Выберите опцию...'),
-                                reply_markup=markup)
+            #else:
+            #    print('SMTP send errors: ', list_senderrors)
+            #    bot.send_message(message.chat.id, ('Что-то пошло не так. Давайте начнем заново.\n'
+            #                                    'Выберите опцию...'),
+            #                    reply_markup=markup)
             return 
         elif  message.text == 'Завершить работу':
             markup = create_markup(('Да', 'Нет'))
             msg = bot.send_message(message.chat.id, 'Вы точно хотите прeкратить?\n Все данные удалятся.', reply_markup=markup)
             bot.register_next_step_handler(msg, process_deletion_step, process_attach_step, 'Message')
             return            
-        letter.update_attachs(message, bot, False, key)
+        letter.update_attachs(message, bot, False, user.key)
         markup = create_markup(('Отправить', 'Завершить работу'))
-        msg = bot.send_message(message.chat.id, 'Прикрепите еще вложениe:', reply_markup=markup)
-        bot.register_next_step_handler(msg, process_attach_step)
+        if message.media_group_id is not None:        
+            start_timer(bot, message, markup, ('Файлы загружены. \n' 
+                    'Прикрепите еще вложениe:'), process_attach_step)
+        else:
+            #bot.send_message(message.chat.id, 'Прикрепите еще вложение:', reply_markup=markup)
+            bot.register_next_step_handler(message, process_attach_step)
+            bot.send_message(message.chat.id, 
+                    ('Файлы загружены. \n' 
+                    'Прикрепите еще вложениe:'), reply_markup=markup)
     except Exception as e:
         msg = bot.reply_to(message, ('Что-то пошло не так. Давайте начнем заново.\n'
                                      'Прикрепите вложение:')

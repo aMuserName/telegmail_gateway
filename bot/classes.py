@@ -45,7 +45,7 @@ class User:
         self.phone = phone
         self.letters = []
         self.registered = registered
-        self.chat_ids = set()
+        self.chat_ids = None
         self.sent = []
         self.number = None
         self.key = None

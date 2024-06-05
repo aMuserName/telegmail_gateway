@@ -59,6 +59,7 @@ class Letter:
         self.attachs = {}
         self.sent = False
         self.edit = False
+        self.id = None
 
     def update_attachs(self, message, bot, empty, key=None):
         if key is None:
@@ -82,7 +83,9 @@ class Letter:
     def update_attachs2(self, message, bot, empty, key=None):
         if key is None:
              key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        file_name, downloaded_file, file_type = self.get_document_by_file_id(message, bot, key) if not empty else (None, None)
+        
+        file_name, downloaded_file, file_type = self.get_document_by_file_id(message, bot, key) if not empty else (None, None, None)
+        
         if file_type == 'photo':
             bited_img = io.BytesIO()    
             f = Image.open(io.BytesIO(downloaded_file)).save(bited_img, format='jpeg')

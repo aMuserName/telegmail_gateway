@@ -13,7 +13,7 @@ ticket = create(**data_for_creation)
 assert ticket['params']['subject'] == data_for_creation["subject"], 'failed create' 
 
 # Test for retrieving ticket info 
-ticket_info = get(reuest_id=ticket['id'])
+ticket_info = get(request_id=ticket['id'])
 assert ticket_info['id'] == ticket['id'], 'failed get'
 
 # Test for sending file with a ticket
